@@ -571,6 +571,7 @@ func (u *Update) GetChanges(id string, as uint32, peerDown bool) (*Path, *Path, 
 		old := getBestPath(id, as, u.OldKnownPathList)
 		best := getBestPath(id, as, u.KnownPathList)
 		if best != nil && best.Equal(old) {
+			return best, old
 			// RFC4684 3.2. Intra-AS VPN Route Distribution
 			// When processing RT membership NLRIs received from internal iBGP
 			// peers, it is necessary to consider all available iBGP paths for a
