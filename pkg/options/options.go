@@ -41,6 +41,7 @@ type KubeRouterConfig struct {
 	MetricsPath             string
 	MetricsPort             uint16
 	NodePortBindOnAllIp     bool
+	NodePortBindOnIp        string
 	OverrideNextHop         bool
 	PeerASNs                []uint
 	PeerMultihopTtl         uint8
@@ -133,6 +134,8 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"Add iptable rules for every Service Endpoint to support hairpin traffic.")
 	fs.BoolVar(&s.NodePortBindOnAllIp, "nodeport-bindon-all-ip", false,
 		"For service of NodePort type create IPVS service that listens on all IP's of the node.")
+	fs.StringVar(&s.NodePortBindOnIp, "nodeport-bindon-ip", "",
+		"For service of NodePort type create IPVS service that listens on this IP instead of the node IP.")
 	fs.BoolVar(&s.EnableOverlay, "enable-overlay", true,
 		"When enable-overlay set to true, IP-in-IP tunneling is used for pod-to-pod networking across nodes in different subnets. "+
 			"When set to false no tunneling is used and routing infrastrcture is expected to route traffic for pod-to-pod networking across nodes in different subnets")

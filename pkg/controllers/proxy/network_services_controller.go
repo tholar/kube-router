@@ -209,6 +209,7 @@ type NetworkServicesController struct {
 	globalHairpin       bool
 	client              kubernetes.Interface
 	nodeportBindOnAllIp bool
+	nodeportBindOnIp    string
 	MetricsEnabled      bool
 	ln                  LinuxNetworking
 	readyForUpdates     bool
@@ -629,15 +630,22 @@ func (nsc *NetworkServicesController) syncIpvsServices(serviceInfoMap serviceInf
 					activeServiceEndpointMap[nodeServiceIds[i]] = make([]string, 0)
 				}
 			} else {
+				ip := nsc.nodeIP
+				if nsc.nodeportBindOnIp != "" {
+					if ip = net.ParseIP(nsc.nodeportBindOnIp); ip == nil {
+						glog.Errorf("Failed to create ipvs service for node port due to: invalid --nodeport-bindon-ip: %s", nsc.nodeportBindOnIp)
+						continue
+					}
+				}
 				ipvsNodeportSvcs = make([]*ipvs.Service, 1)
-				ipvsNodeportSvcs[0], err = nsc.ln.ipvsAddService(ipvsSvcs, nsc.nodeIP, protocol, uint16(svc.nodePort), svc.sessionAffinity, svc.scheduler, svc.flags)
+				ipvsNodeportSvcs[0], err = nsc.ln.ipvsAddService(ipvsSvcs, ip, protocol, uint16(svc.nodePort), svc.sessionAffinity, svc.scheduler, svc.flags)
 				if err != nil {
 					glog.Errorf("Failed to create ipvs service for node port due to: %s", err.Error())
 					continue
 				}
 
 				nodeServiceIds = make([]string, 1)
-				nodeServiceIds[0] = generateIpPortId(nsc.nodeIP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
+				nodeServiceIds[0] = generateIpPortId(ip.String(), svc.protocol, strconv.Itoa(svc.nodePort))
 				activeServiceEndpointMap[nodeServiceIds[0]] = make([]string, 0)
 			}
 		}
@@ -2083,6 +2091,8 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 	if config.NodePortBindOnAllIp {
 		nsc.nodeportBindOnAllIp = true
 	}
+
+	nsc.nodeportBindOnIp = config.NodePortBindOnIp
 
 	if config.RunRouter {
 		cidr, err := utils.GetPodCidrFromNodeSpec(nsc.client, config.HostnameOverride)
