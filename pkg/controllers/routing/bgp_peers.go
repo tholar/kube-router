@@ -30,18 +30,21 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 	start := time.Now()
 	defer func() {
 		endTime := time.Since(start)
-		metrics.ControllerBGPInternalPeersSyncTime.WithLabelValues().Set(float64(endTime.Seconds()))
+		if nrc.MetricsEnabled {
+			metrics.ControllerBGPInternalPeersSyncTime.Observe(endTime.Seconds())
+		}
 		glog.V(2).Infof("Syncing BGP peers for the node took %v", endTime)
 	}()
 
 	// get the current list of the nodes from API server
 	nodes, err := nrc.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
-		glog.Errorf("Failed to list nodes from API server due to: %s. Can not perform BGP peer sync", err.Error())
+		glog.Errorf("Failed to list nodes from API server due to: %s. Cannot perform BGP peer sync", err.Error())
 		return
 	}
-
-	metrics.ControllerBPGpeers.WithLabelValues().Set(float64(len(nodes.Items)))
+	if nrc.MetricsEnabled {
+		metrics.ControllerBPGpeers.Set(float64(len(nodes.Items)))
+	}
 	// establish peer and add Pod CIDRs with current set of nodes
 	currentNodes := make([]string, 0)
 	for _, node := range nodes.Items {
@@ -112,6 +115,17 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 				{
 					Config: config.AfiSafiConfig{
 						AfiSafiName: config.AFI_SAFI_TYPE_IPV4_UNICAST,
+						Enabled:     true,
+					},
+					MpGracefulRestart: config.MpGracefulRestart{
+						Config: config.MpGracefulRestartConfig{
+							Enabled: true,
+						},
+					},
+				},
+				{
+					Config: config.AfiSafiConfig{
+						AfiSafiName: config.AFI_SAFI_TYPE_IPV6_UNICAST,
 						Enabled:     true,
 					},
 					MpGracefulRestart: config.MpGracefulRestart{
@@ -196,6 +210,17 @@ func connectToExternalBGPPeers(server *gobgp.BgpServer, peerNeighbors []*config.
 				{
 					Config: config.AfiSafiConfig{
 						AfiSafiName: config.AFI_SAFI_TYPE_IPV4_UNICAST,
+						Enabled:     true,
+					},
+					MpGracefulRestart: config.MpGracefulRestart{
+						Config: config.MpGracefulRestartConfig{
+							Enabled: true,
+						},
+					},
+				},
+				{
+					Config: config.AfiSafiConfig{
+						AfiSafiName: config.AFI_SAFI_TYPE_IPV6_UNICAST,
 						Enabled:     true,
 					},
 					MpGracefulRestart: config.MpGracefulRestart{
@@ -325,9 +350,9 @@ func (nrc *NetworkRoutingController) OnNodeUpdate(obj interface{}) {
 	}
 
 	// update export policies so that NeighborSet gets updated with new set of nodes
-	err := nrc.addExportPolicies()
+	err := nrc.AddPolicies()
 	if err != nil {
-		glog.Errorf("Error adding BGP export policies: %s", err.Error())
+		glog.Errorf("Error adding BGP policies: %s", err.Error())
 	}
 
 	if nrc.bgpEnableInternal {

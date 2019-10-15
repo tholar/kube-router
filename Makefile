@@ -8,7 +8,7 @@ IMG_NAMESPACE?=cloudnativelabs
 GIT_COMMIT=$(shell git describe --tags --dirty)
 GIT_BRANCH?=$(shell git rev-parse --abbrev-ref HEAD)
 IMG_TAG?=$(if $(IMG_TAG_PREFIX),$(IMG_TAG_PREFIX)-)$(if $(ARCH_TAG_PREFIX),$(ARCH_TAG_PREFIX)-)$(GIT_BRANCH)
-RELEASE_TAG?=$(shell build/get-git-tag.sh)
+RELEASE_TAG?=$(GOARCH)-$(shell build/get-git-tag.sh)
 REGISTRY?=$(if $(IMG_FQDN),$(IMG_FQDN)/$(IMG_NAMESPACE)/$(NAME),$(IMG_NAMESPACE)/$(NAME))
 REGISTRY_DEV?=$(REGISTRY)$(DEV_SUFFIX)
 IN_DOCKER_GROUP=$(filter docker,$(shell groups))
@@ -17,7 +17,7 @@ DOCKER=$(if $(or $(IN_DOCKER_GROUP),$(IS_ROOT),$(OSX)),docker,sudo docker)
 MAKEFILE_DIR=$(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 UPSTREAM_IMPORT_PATH=$(GOPATH)/src/github.com/cloudnativelabs/kube-router/
 BUILD_IN_DOCKER?=false
-DOCKER_BUILD_IMAGE?=golang:1.10.3-alpine
+DOCKER_BUILD_IMAGE?=golang:1.10.8-alpine3.9
 ifeq ($(GOARCH), arm)
 ARCH_TAG_PREFIX=$(GOARCH)
 FILE_ARCH=ARM
@@ -31,6 +31,7 @@ ARCH_TAG_PREFIX=$(GOARCH)
 FILE_ARCH=IBM S/390
 DOCKERFILE_SED_EXPR?=
 else
+ARCH_TAG_PREFIX=amd64
 DOCKERFILE_SED_EXPR?=
 FILE_ARCH=x86-64
 endif
@@ -53,9 +54,9 @@ endif
 test: gofmt gomoqs ## Runs code quality pipelines (gofmt, tests, coverage, lint, etc)
 ifeq "$(BUILD_IN_DOCKER)" "true"
 	$(DOCKER) run -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router -w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
-	    sh -c 'go test github.com/cloudnativelabs/kube-router/cmd/kube-router/ github.com/cloudnativelabs/kube-router/pkg/...'
+	    sh -c 'go test -v -timeout 30s github.com/cloudnativelabs/kube-router/cmd/kube-router/ github.com/cloudnativelabs/kube-router/pkg/...'
 else
-		go test github.com/cloudnativelabs/kube-router/cmd/kube-router/ github.com/cloudnativelabs/kube-router/pkg/...
+		go test -v -timeout 30s github.com/cloudnativelabs/kube-router/cmd/kube-router/ github.com/cloudnativelabs/kube-router/pkg/...
 endif
 
 vagrant-up: export docker=$(DOCKER)
@@ -120,9 +121,20 @@ push-release: push
 	@echo Starting kube-router release container image push.
 	@test -n "$(RELEASE_TAG)"
 	$(DOCKER) tag "$(REGISTRY_DEV):$(IMG_TAG)" "$(REGISTRY):$(RELEASE_TAG)"
-	$(DOCKER) tag "$(REGISTRY):$(RELEASE_TAG)" "$(REGISTRY):latest"
 	$(DOCKER) push "$(REGISTRY)"
 	@echo Finished kube-router release container image push.
+
+push-manifest:
+	@echo Starting kube-router manifest push.
+	./manifest-tool push from-args \
+		--platforms linux/amd64,linux/arm64,linux/arm,linux/s390x \
+		--template "$(REGISTRY):ARCH-${RELEASE_TAG}" \
+		--target "$(REGISTRY):$(RELEASE_TAG)"
+
+	./manifest-tool push from-args \
+		--platforms linux/amd64,linux/arm64,linux/arm,linux/s390x \
+		--template "$(REGISTRY):ARCH-${RELEASE_TAG}" \
+		--target "$(REGISTRY):latest"
 
 github-release:
 	@echo Starting kube-router GitHub release creation.
@@ -151,8 +163,13 @@ gomoqs: ./pkg/controllers/proxy/network_services_controller_moq.go
 # file_moq.go file is generated from file.go "//go:generate moq ..." in-file
 # annotation, as it needs to know which interfaces to create mock stubs for
 %_moq.go: %.go
-	@test -x $(GOPATH)/bin/moq && exit 0; echo "ERROR: 'moq' tool is needed to update mock test files, install it with: \ngo get github.com/matryer/moq\n"; exit 1
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router -w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
+			sh -c 'apk add --no-cache git build-base && go get github.com/matryer/moq && go generate -v $(*).go'
+else
+	@test -x $(lastword $(subst :, ,$(GOPATH)))/bin/moq && exit 0; echo "ERROR: 'moq' tool is needed to update mock test files, install it with: \ngo get github.com/matryer/moq\n"; exit 1
 	go generate -v $(*).go
+endif
 
 gopath: ## Warns about issues building from a directory that does not match upstream.
 	@echo 'Checking project path for import issues...'
@@ -191,8 +208,16 @@ else
 endif
 
 gobgp:
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	@echo Building gobgp
+	$(DOCKER) run -v $(PWD)/vendor:/go/src -w /go/src/github.com/osrg/gobgp/gobgp $(DOCKER_BUILD_IMAGE) \
+    sh -c 'GOARCH=$(GOARCH) CGO_ENABLED=0 go build -o gobgp'
+	@echo Finished building gobgp.
+else
 	cd vendor/github.com/osrg/gobgp/gobgp && \
-	CGO_ENABLED=0 GOARCH=$(GOARCH) GOOS=linux go build -o $(MAKEFILE_DIR)/gobgp
+	CGO_ENABLED=0 GOARCH=$(GOARCH) GOOS=linux go build -o gobgp
+endif
+	cp -f vendor/github.com/osrg/gobgp/gobgp/gobgp gobgp
 
 multiarch-binverify:
 	@echo 'Verifying kube-router gobgp for ARCH=$(FILE_ARCH) ...'

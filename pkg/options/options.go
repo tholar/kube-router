@@ -4,8 +4,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/spf13/pflag"
 	"strconv"
+
+	"github.com/spf13/pflag"
 )
 
 const DEFAULT_BGP_PORT = 179
@@ -28,12 +29,15 @@ type KubeRouterConfig struct {
 	EnablePodEgress         bool
 	EnablePprof             bool
 	FullMeshMode            bool
+	OverlayType             string
 	GlobalHairpinMode       bool
 	HealthPort              uint16
 	HelpRequested           bool
 	HostnameOverride        string
 	IPTablesSyncPeriod      time.Duration
 	IpvsSyncPeriod          time.Duration
+	IpvsGracefulPeriod      time.Duration
+	IpvsGracefulTermination bool
 	Kubeconfig              string
 	MasqueradeAll           bool
 	Master                  string
@@ -62,8 +66,10 @@ func NewKubeRouterConfig() *KubeRouterConfig {
 		CacheSyncTimeout:   1 * time.Minute,
 		IpvsSyncPeriod:     5 * time.Minute,
 		IPTablesSyncPeriod: 5 * time.Minute,
+		IpvsGracefulPeriod: 30 * time.Second,
 		RoutesSyncPeriod:   5 * time.Minute,
 		EnableOverlay:      true,
+		OverlayType:        "subnet",
 	}
 }
 
@@ -96,6 +102,10 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"The delay between iptables rule synchronizations (e.g. '5s', '1m'). Must be greater than 0.")
 	fs.DurationVar(&s.IpvsSyncPeriod, "ipvs-sync-period", s.IpvsSyncPeriod,
 		"The delay between ipvs config synchronizations (e.g. '5s', '1m', '2h22m'). Must be greater than 0.")
+	fs.DurationVar(&s.IpvsGracefulPeriod, "ipvs-graceful-period", s.IpvsGracefulPeriod,
+		"The graceful period before removing destinations from IPVS services (e.g. '5s', '1m', '2h22m'). Must be greater than 0.")
+	fs.BoolVar(&s.IpvsGracefulTermination, "ipvs-graceful-termination", false,
+		"Enables the experimental IPVS graceful terminaton capability")
 	fs.DurationVar(&s.RoutesSyncPeriod, "routes-sync-period", s.RoutesSyncPeriod,
 		"The delay between route updates and advertisements (e.g. '5s', '1m', '2h22m'). Must be greater than 0.")
 	fs.BoolVar(&s.AdvertiseClusterIp, "advertise-cluster-ip", false,
@@ -130,12 +140,16 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&s.HostnameOverride, "hostname-override", s.HostnameOverride,
 		"Overrides the NodeName of the node. Set this if kube-router is unable to determine your NodeName automatically.")
 	fs.BoolVar(&s.GlobalHairpinMode, "hairpin-mode", false,
-		"Add iptable rules for every Service Endpoint to support hairpin traffic.")
+		"Add iptables rules for every Service Endpoint to support hairpin traffic.")
 	fs.BoolVar(&s.NodePortBindOnAllIp, "nodeport-bindon-all-ip", false,
 		"For service of NodePort type create IPVS service that listens on all IP's of the node.")
 	fs.BoolVar(&s.EnableOverlay, "enable-overlay", true,
-		"When enable-overlay set to true, IP-in-IP tunneling is used for pod-to-pod networking across nodes in different subnets. "+
-			"When set to false no tunneling is used and routing infrastrcture is expected to route traffic for pod-to-pod networking across nodes in different subnets")
+		"When enable-overlay is set to true, IP-in-IP tunneling is used for pod-to-pod networking across nodes in different subnets. "+
+			"When set to false no tunneling is used and routing infrastructure is expected to route traffic for pod-to-pod networking across nodes in different subnets")
+	fs.StringVar(&s.OverlayType, "overlay-type", s.OverlayType,
+		"Possible values: subnet,full - "+
+			"When set to \"subnet\", the default, default \"--enable-overlay=true\" behavior is used. "+
+			"When set to \"full\", it changes \"--enable-overlay=true\" default behavior so that IP-in-IP tunneling is used for pod-to-pod networking across nodes regardless of the subnet the nodes are in.")
 	fs.StringSliceVar(&s.PeerPasswords, "peer-router-passwords", s.PeerPasswords,
 		"Password for authenticating against the BGP peer defined with \"--peer-router-ips\".")
 	fs.BoolVar(&s.EnablePprof, "enable-pprof", false,

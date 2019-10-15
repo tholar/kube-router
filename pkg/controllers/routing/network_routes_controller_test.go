@@ -446,7 +446,7 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "svc-1",
 						Annotations: map[string]string{
-							"kube-router.io/service.skiplbips": "true",
+							svcSkipLbIpsAnnotation: "true",
 						},
 					},
 					Spec: v1core.ServiceSpec{
@@ -501,6 +501,352 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			testcase.nrc.advertiseClusterIP = false
 			testcase.nrc.advertiseExternalIP = true
 			testcase.nrc.advertiseLoadBalancerIP = true
+
+			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
+			testcase.nrc.advertiseVIPs(toAdvertise)
+			testcase.nrc.withdrawVIPs(toWithdraw)
+
+			watchEvents := waitForBGPWatchEventWithTimeout(time.Second*10, len(testcase.watchEvents), w, t)
+			for _, watchEvent := range watchEvents {
+				for _, path := range watchEvent.PathList {
+					if _, ok := testcase.watchEvents[path.GetNlri().String()]; ok {
+						continue
+					} else {
+						t.Errorf("got unexpected path: %v", path.GetNlri().String())
+					}
+				}
+			}
+		})
+	}
+}
+
+func Test_advertiseAnnotationOptOut(t *testing.T) {
+	testcases := []struct {
+		name             string
+		nrc              *NetworkRoutingController
+		existingServices []*v1core.Service
+		// the key is the subnet from the watch event
+		watchEvents map[string]bool
+	}{
+		{
+			"add bgp paths for all service IPs",
+			&NetworkRoutingController{
+				bgpServer: gobgp.NewBgpServer(),
+			},
+			[]*v1core.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-1",
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "ClusterIP",
+						ClusterIP:   "10.0.0.1",
+						ExternalIPs: []string{"1.1.1.1"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-2",
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "NodePort",
+						ClusterIP:   "10.0.0.2",
+						ExternalIPs: []string{"2.2.2.2", "3.3.3.3"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-3",
+					},
+					Spec: v1core.ServiceSpec{
+						Type:      "LoadBalancer",
+						ClusterIP: "10.0.0.3",
+						// ignored since LoadBalancer services don't
+						// advertise external IPs.
+						ExternalIPs: []string{"4.4.4.4"},
+					},
+					Status: v1core.ServiceStatus{
+						LoadBalancer: v1core.LoadBalancerStatus{
+							Ingress: []v1core.LoadBalancerIngress{
+								{
+									IP: "10.0.255.1",
+								},
+								{
+									IP: "10.0.255.2",
+								},
+							},
+						},
+					},
+				},
+			},
+			map[string]bool{
+				"10.0.0.1/32":   true,
+				"10.0.0.2/32":   true,
+				"10.0.0.3/32":   true,
+				"1.1.1.1/32":    true,
+				"2.2.2.2/32":    true,
+				"3.3.3.3/32":    true,
+				"10.0.255.1/32": true,
+				"10.0.255.2/32": true,
+			},
+		},
+		{
+			"opt out to advertise any IPs via annotations",
+			&NetworkRoutingController{
+				bgpServer: gobgp.NewBgpServer(),
+			},
+			[]*v1core.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-1",
+						Annotations: map[string]string{
+							svcAdvertiseClusterAnnotation:      "false",
+							svcAdvertiseExternalAnnotation:     "false",
+							svcAdvertiseLoadBalancerAnnotation: "false",
+						},
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "LoadBalancer",
+						ClusterIP:   "10.0.0.1",
+						ExternalIPs: []string{"1.1.1.1", "2.2.2.2"},
+					},
+					Status: v1core.ServiceStatus{
+						LoadBalancer: v1core.LoadBalancerStatus{
+							Ingress: []v1core.LoadBalancerIngress{
+								{
+									IP: "10.0.255.1",
+								},
+								{
+									IP: "10.0.255.2",
+								},
+							},
+						},
+					},
+				},
+			},
+			map[string]bool{},
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			go testcase.nrc.bgpServer.Serve()
+			err := testcase.nrc.bgpServer.Start(&config.Global{
+				Config: config.GlobalConfig{
+					As:       1,
+					RouterId: "10.0.0.0",
+					Port:     10000,
+				},
+			})
+			if err != nil {
+				t.Fatalf("failed to start BGP server: %v", err)
+			}
+			defer testcase.nrc.bgpServer.Stop()
+			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
+
+			clientset := fake.NewSimpleClientset()
+			startInformersForRoutes(testcase.nrc, clientset)
+
+			err = createServices(clientset, testcase.existingServices)
+			if err != nil {
+				t.Fatalf("failed to create existing services: %v", err)
+			}
+
+			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
+
+			// By default advertise all IPs
+			testcase.nrc.advertiseClusterIP = true
+			testcase.nrc.advertiseExternalIP = true
+			testcase.nrc.advertiseLoadBalancerIP = true
+
+			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
+			testcase.nrc.advertiseVIPs(toAdvertise)
+			testcase.nrc.withdrawVIPs(toWithdraw)
+
+			watchEvents := waitForBGPWatchEventWithTimeout(time.Second*10, len(testcase.watchEvents), w, t)
+			for _, watchEvent := range watchEvents {
+				for _, path := range watchEvent.PathList {
+					if _, ok := testcase.watchEvents[path.GetNlri().String()]; ok {
+						continue
+					} else {
+						t.Errorf("got unexpected path: %v", path.GetNlri().String())
+					}
+				}
+			}
+		})
+	}
+}
+
+func Test_advertiseAnnotationOptIn(t *testing.T) {
+	testcases := []struct {
+		name             string
+		nrc              *NetworkRoutingController
+		existingServices []*v1core.Service
+		// the key is the subnet from the watch event
+		watchEvents map[string]bool
+	}{
+		{
+			"no bgp paths for any service IPs",
+			&NetworkRoutingController{
+				bgpServer: gobgp.NewBgpServer(),
+			},
+			[]*v1core.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-1",
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "ClusterIP",
+						ClusterIP:   "10.0.0.1",
+						ExternalIPs: []string{"1.1.1.1"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-2",
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "NodePort",
+						ClusterIP:   "10.0.0.2",
+						ExternalIPs: []string{"2.2.2.2", "3.3.3.3"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-3",
+					},
+					Spec: v1core.ServiceSpec{
+						Type:      "LoadBalancer",
+						ClusterIP: "10.0.0.3",
+						// ignored since LoadBalancer services don't
+						// advertise external IPs.
+						ExternalIPs: []string{"4.4.4.4"},
+					},
+					Status: v1core.ServiceStatus{
+						LoadBalancer: v1core.LoadBalancerStatus{
+							Ingress: []v1core.LoadBalancerIngress{
+								{
+									IP: "10.0.255.1",
+								},
+								{
+									IP: "10.0.255.2",
+								},
+							},
+						},
+					},
+				},
+			},
+			map[string]bool{},
+		},
+		{
+			"opt in to advertise all IPs via annotations",
+			&NetworkRoutingController{
+				bgpServer: gobgp.NewBgpServer(),
+			},
+			[]*v1core.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-1",
+						Annotations: map[string]string{
+							svcAdvertiseClusterAnnotation:      "true",
+							svcAdvertiseExternalAnnotation:     "true",
+							svcAdvertiseLoadBalancerAnnotation: "true",
+						},
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "ClusterIP",
+						ClusterIP:   "10.0.0.1",
+						ExternalIPs: []string{"1.1.1.1"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-2",
+						Annotations: map[string]string{
+							svcAdvertiseClusterAnnotation:      "true",
+							svcAdvertiseExternalAnnotation:     "true",
+							svcAdvertiseLoadBalancerAnnotation: "true",
+						},
+					},
+					Spec: v1core.ServiceSpec{
+						Type:        "NodePort",
+						ClusterIP:   "10.0.0.2",
+						ExternalIPs: []string{"2.2.2.2", "3.3.3.3"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "svc-3",
+						Annotations: map[string]string{
+							svcAdvertiseClusterAnnotation:      "true",
+							svcAdvertiseExternalAnnotation:     "true",
+							svcAdvertiseLoadBalancerAnnotation: "true",
+						},
+					},
+					Spec: v1core.ServiceSpec{
+						Type:      "LoadBalancer",
+						ClusterIP: "10.0.0.3",
+						// ignored since LoadBalancer services don't
+						// advertise external IPs.
+						ExternalIPs: []string{"4.4.4.4"},
+					},
+					Status: v1core.ServiceStatus{
+						LoadBalancer: v1core.LoadBalancerStatus{
+							Ingress: []v1core.LoadBalancerIngress{
+								{
+									IP: "10.0.255.1",
+								},
+								{
+									IP: "10.0.255.2",
+								},
+							},
+						},
+					},
+				},
+			},
+			map[string]bool{
+				"10.0.0.1/32":   true,
+				"10.0.0.2/32":   true,
+				"10.0.0.3/32":   true,
+				"1.1.1.1/32":    true,
+				"2.2.2.2/32":    true,
+				"3.3.3.3/32":    true,
+				"10.0.255.1/32": true,
+				"10.0.255.2/32": true,
+			},
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			go testcase.nrc.bgpServer.Serve()
+			err := testcase.nrc.bgpServer.Start(&config.Global{
+				Config: config.GlobalConfig{
+					As:       1,
+					RouterId: "10.0.0.0",
+					Port:     10000,
+				},
+			})
+			if err != nil {
+				t.Fatalf("failed to start BGP server: %v", err)
+			}
+			defer testcase.nrc.bgpServer.Stop()
+			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
+
+			clientset := fake.NewSimpleClientset()
+			startInformersForRoutes(testcase.nrc, clientset)
+
+			err = createServices(clientset, testcase.existingServices)
+			if err != nil {
+				t.Fatalf("failed to create existing services: %v", err)
+			}
+
+			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
+
+			// By default do not advertise any IPs
+			testcase.nrc.advertiseClusterIP = false
+			testcase.nrc.advertiseExternalIP = false
+			testcase.nrc.advertiseLoadBalancerIP = false
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
 			testcase.nrc.advertiseVIPs(toAdvertise)
@@ -1136,18 +1482,21 @@ func Test_OnNodeUpdate(t *testing.T) {
 }
 */
 
-func Test_addExportPolicies(t *testing.T) {
-	testcases := []struct {
-		name                   string
-		nrc                    *NetworkRoutingController
-		existingNodes          []*v1core.Node
-		existingServices       []*v1core.Service
-		podDefinedSet          *config.DefinedSets
-		clusterIPDefinedSet    *config.DefinedSets
-		externalPeerDefinedSet *config.DefinedSets
-		policyStatements       []*config.Statement
-		err                    error
-	}{
+type PolicyTestCase struct {
+	name                   string
+	nrc                    *NetworkRoutingController
+	existingNodes          []*v1core.Node
+	existingServices       []*v1core.Service
+	podDefinedSet          *config.DefinedSets
+	clusterIPDefinedSet    *config.DefinedSets
+	externalPeerDefinedSet *config.DefinedSets
+	exportPolicyStatements []*config.Statement
+	importPolicyStatements []*config.Statement
+	err                    error
+}
+
+func Test_AddPolicies(t *testing.T) {
+	testcases := []PolicyTestCase{
 		{
 			"has nodes and services",
 			&NetworkRoutingController{
@@ -1231,7 +1580,7 @@ func Test_addExportPolicies(t *testing.T) {
 			&config.DefinedSets{},
 			[]*config.Statement{
 				{
-					Name: "kube_router_stmt0",
+					Name: "kube_router_export_stmt0",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "podcidrprefixset",
@@ -1244,6 +1593,20 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 					Actions: config.Actions{
 						RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
+					},
+				},
+			},
+			[]*config.Statement{
+				{
+					Name: "kube_router_import_stmt0",
+					Conditions: config.Conditions{
+						MatchPrefixSet: config.MatchPrefixSet{
+							PrefixSet:       "clusteripprefixset",
+							MatchSetOptions: config.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+						},
+					},
+					Actions: config.Actions{
+						RouteDisposition: config.ROUTE_DISPOSITION_REJECT_ROUTE,
 					},
 				},
 			},
@@ -1350,7 +1713,7 @@ func Test_addExportPolicies(t *testing.T) {
 			},
 			[]*config.Statement{
 				{
-					Name: "kube_router_stmt0",
+					Name: "kube_router_export_stmt0",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "podcidrprefixset",
@@ -1366,7 +1729,7 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 				},
 				{
-					Name: "kube_router_stmt1",
+					Name: "kube_router_export_stmt1",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "clusteripprefixset",
@@ -1379,6 +1742,20 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 					Actions: config.Actions{
 						RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
+					},
+				},
+			},
+			[]*config.Statement{
+				{
+					Name: "kube_router_import_stmt0",
+					Conditions: config.Conditions{
+						MatchPrefixSet: config.MatchPrefixSet{
+							PrefixSet:       "clusteripprefixset",
+							MatchSetOptions: config.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+						},
+					},
+					Actions: config.Actions{
+						RouteDisposition: config.ROUTE_DISPOSITION_REJECT_ROUTE,
 					},
 				},
 			},
@@ -1485,7 +1862,7 @@ func Test_addExportPolicies(t *testing.T) {
 			},
 			[]*config.Statement{
 				{
-					Name: "kube_router_stmt0",
+					Name: "kube_router_export_stmt0",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "clusteripprefixset",
@@ -1498,6 +1875,20 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 					Actions: config.Actions{
 						RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
+					},
+				},
+			},
+			[]*config.Statement{
+				{
+					Name: "kube_router_import_stmt0",
+					Conditions: config.Conditions{
+						MatchPrefixSet: config.MatchPrefixSet{
+							PrefixSet:       "clusteripprefixset",
+							MatchSetOptions: config.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+						},
+					},
+					Actions: config.Actions{
+						RouteDisposition: config.ROUTE_DISPOSITION_REJECT_ROUTE,
 					},
 				},
 			},
@@ -1607,7 +1998,7 @@ func Test_addExportPolicies(t *testing.T) {
 			},
 			[]*config.Statement{
 				{
-					Name: "kube_router_stmt0",
+					Name: "kube_router_export_stmt0",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "podcidrprefixset",
@@ -1623,7 +2014,7 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 				},
 				{
-					Name: "kube_router_stmt1",
+					Name: "kube_router_export_stmt1",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "clusteripprefixset",
@@ -1642,6 +2033,20 @@ func Test_addExportPolicies(t *testing.T) {
 								RepeatN: 5,
 							},
 						},
+					},
+				},
+			},
+			[]*config.Statement{
+				{
+					Name: "kube_router_import_stmt0",
+					Conditions: config.Conditions{
+						MatchPrefixSet: config.MatchPrefixSet{
+							PrefixSet:       "clusteripprefixset",
+							MatchSetOptions: config.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+						},
+					},
+					Actions: config.Actions{
+						RouteDisposition: config.ROUTE_DISPOSITION_REJECT_ROUTE,
 					},
 				},
 			},
@@ -1750,7 +2155,7 @@ func Test_addExportPolicies(t *testing.T) {
 			},
 			[]*config.Statement{
 				{
-					Name: "kube_router_stmt0",
+					Name: "kube_router_export_stmt0",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "podcidrprefixset",
@@ -1766,7 +2171,7 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 				},
 				{
-					Name: "kube_router_stmt1",
+					Name: "kube_router_export_stmt1",
 					Conditions: config.Conditions{
 						MatchPrefixSet: config.MatchPrefixSet{
 							PrefixSet:       "clusteripprefixset",
@@ -1779,6 +2184,20 @@ func Test_addExportPolicies(t *testing.T) {
 					},
 					Actions: config.Actions{
 						RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
+					},
+				},
+			},
+			[]*config.Statement{
+				{
+					Name: "kube_router_import_stmt0",
+					Conditions: config.Conditions{
+						MatchPrefixSet: config.MatchPrefixSet{
+							PrefixSet:       "clusteripprefixset",
+							MatchSetOptions: config.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+						},
+					},
+					Actions: config.Actions{
+						RouteDisposition: config.ROUTE_DISPOSITION_REJECT_ROUTE,
 					},
 				},
 			},
@@ -1821,7 +2240,7 @@ func Test_addExportPolicies(t *testing.T) {
 			informerFactory := informers.NewSharedInformerFactory(testcase.nrc.clientset, 0)
 			nodeInformer := informerFactory.Core().V1().Nodes().Informer()
 			testcase.nrc.nodeLister = nodeInformer.GetIndexer()
-			err = testcase.nrc.addExportPolicies()
+			err = testcase.nrc.AddPolicies()
 			if !reflect.DeepEqual(err, testcase.err) {
 				t.Logf("expected err %v", testcase.err)
 				t.Logf("actual err %v", err)
@@ -1861,51 +2280,57 @@ func Test_addExportPolicies(t *testing.T) {
 				t.Error("unexpected external peer defined set")
 			}
 
-			policies := testcase.nrc.bgpServer.GetPolicy()
-			policyExists := false
-			for _, policy := range policies {
-				if policy.Name == "kube_router" {
-					policyExists = true
-					break
-				}
-			}
-			if !policyExists {
-				t.Errorf("policy 'kube_router' was not added")
-			}
-
-			routeType, policyAssignments, err := testcase.nrc.bgpServer.GetPolicyAssignment("", table.POLICY_DIRECTION_EXPORT)
-			if routeType != table.ROUTE_TYPE_REJECT {
-				t.Errorf("expected route type 'reject' for export policy assignment, but got %v", routeType)
-			}
-			if err != nil {
-				t.Fatalf("failed to get policy assignments: %v", err)
-			}
-
-			policyAssignmentExists := false
-			for _, policyAssignment := range policyAssignments {
-				if policyAssignment.Name == "kube_router" {
-					policyAssignmentExists = true
-				}
-			}
-
-			if !policyAssignmentExists {
-				t.Error("export policy assignment 'kube_router' was not added")
-			}
-
-			statements := testcase.nrc.bgpServer.GetStatement()
-			for _, expectedStatement := range testcase.policyStatements {
-				found := false
-				for _, statement := range statements {
-					if reflect.DeepEqual(statement, expectedStatement) {
-						found = true
-					}
-				}
-
-				if !found {
-					t.Errorf("statement %v not found", expectedStatement)
-				}
-			}
+			checkPolicies(t, testcase, table.POLICY_DIRECTION_EXPORT, table.ROUTE_TYPE_REJECT, testcase.exportPolicyStatements)
+			checkPolicies(t, testcase, table.POLICY_DIRECTION_IMPORT, table.ROUTE_TYPE_ACCEPT, testcase.importPolicyStatements)
 		})
+	}
+}
+
+func checkPolicies(t *testing.T, testcase PolicyTestCase, direction table.PolicyDirection, defaultPolicy table.RouteType,
+	policyStatements []*config.Statement) {
+	policies := testcase.nrc.bgpServer.GetPolicy()
+	policyExists := false
+	for _, policy := range policies {
+		if policy.Name == "kube_router_"+direction.String() {
+			policyExists = true
+			break
+		}
+	}
+	if !policyExists {
+		t.Errorf("policy 'kube_router_%v' was not added", direction)
+	}
+
+	routeType, policyAssignments, err := testcase.nrc.bgpServer.GetPolicyAssignment("", direction)
+	if routeType != defaultPolicy {
+		t.Errorf("expected route type '%v' for %v policy assignment, but got %v", defaultPolicy, direction, routeType)
+	}
+	if err != nil {
+		t.Fatalf("failed to get policy assignments: %v", err)
+	}
+
+	policyAssignmentExists := false
+	for _, policyAssignment := range policyAssignments {
+		if policyAssignment.Name == "kube_router_"+direction.String() {
+			policyAssignmentExists = true
+		}
+	}
+
+	if !policyAssignmentExists {
+		t.Errorf("export policy assignment 'kube_router_%v' was not added", direction)
+	}
+
+	statements := testcase.nrc.bgpServer.GetStatement()
+	for _, expectedStatement := range policyStatements {
+		found := false
+		for _, statement := range statements {
+			if reflect.DeepEqual(statement, expectedStatement) {
+				found = true
+			}
+		}
+
+		if !found {
+			t.Errorf("statement %v not found", expectedStatement)
+		}
 	}
 }
 
