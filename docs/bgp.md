@@ -62,6 +62,8 @@ for Route Reflector client mode.
 
 Only nodes with the same ClusterID in client and server mode will peer together.
 
+When joining new nodes to the cluster, remember to annotate them with `kube-router.io/rr.client=42`, and then restart kube-router on the new nodes and the route reflector server nodes to let them successfully read the annotations and peer with each other.
+
 ## Peering Outside The Cluster
 ### Global External BGP Peers
 
@@ -74,7 +76,7 @@ more than one peer router by specifying a slice of BGP peers.
 For example:
 ```
 --peer-router-ips="192.168.1.99,192.168.1.100"
---peer-router-asns="65000,65000"
+--peer-router-asns=65000,65000
 ```
 
 ### Node Specific External BGP Peers
@@ -120,8 +122,8 @@ kube-router requires that they are encoded as base64.
 
 On a Linux or MacOS system you can encode your passwords on the command line:
 ```
-$ echo "SecurePassword" | base64
-U2VjdXJlUGFzc3dvcmQK
+$ printf "SecurePassword" | base64
+U2VjdXJlUGFzc3dvcmQ=
 ```
 
 #### Password Configuration Examples

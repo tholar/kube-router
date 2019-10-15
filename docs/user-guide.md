@@ -49,14 +49,16 @@ Usage of kube-router:
       --disable-source-dest-check        Disable the source-dest-check attribute for AWS EC2 instances. When this option is false, it must be set some other way. (default true)
       --enable-cni                       Enable CNI plugin. Disable if you want to use kube-router features alongside another CNI plugin. (default true)
       --enable-ibgp                      Enables peering with nodes with the same ASN, if disabled will only peer with external BGP peers (default true)
-      --enable-overlay                   When enable-overlay set to true, IP-in-IP tunneling is used for pod-to-pod networking across nodes in different subnets. When set to false no tunneling is used and routing infrastrcture is expected to route traffic for pod-to-pod networking across nodes in different subnets (default true)
+      --enable-overlay                   When enable-overlay is set to true, IP-in-IP tunneling is used for pod-to-pod networking across nodes in different subnets. When set to false no tunneling is used and routing infrastructure is expected to route traffic for pod-to-pod networking across nodes in different subnets (default true)
       --enable-pod-egress                SNAT traffic from Pods to destinations outside the cluster. (default true)
       --enable-pprof                     Enables pprof for debugging performance and memory leak issues.
-      --hairpin-mode                     Add iptable rules for every Service Endpoint to support hairpin traffic.
+      --hairpin-mode                     Add iptables rules for every Service Endpoint to support hairpin traffic.
       --health-port uint16               Health check port, 0 = Disabled (default 20244)
   -h, --help                             Print usage information.
       --hostname-override string         Overrides the NodeName of the node. Set this if kube-router is unable to determine your NodeName automatically.
       --iptables-sync-period duration    The delay between iptables rule synchronizations (e.g. '5s', '1m'). Must be greater than 0. (default 5m0s)
+      --ipvs-graceful-period duration    The graceful period before removing destinations from IPVS services (e.g. '5s', '1m', '2h22m'). Must be greater than 0. (default 30s)
+      --ipvs-graceful-termination        Enables the experimental IPVS graceful terminaton capability
       --ipvs-sync-period duration        The delay between ipvs config synchronizations (e.g. '5s', '1m', '2h22m'). Must be greater than 0. (default 5m0s)
       --kubeconfig string                Path to kubeconfig file with authorization information (the master location is set by the master flag).
       --masquerade-all                   SNAT all traffic to cluster IP/node port.
@@ -66,6 +68,7 @@ Usage of kube-router:
       --nodeport-bindon-all-ip           For service of NodePort type create IPVS service that listens on all IP's of the node.
       --nodeport-bindon-ip string        For service of NodePort type create IPVS service that listens on this IP instead of the node IP.
       --nodes-full-mesh                  Each node in the cluster will setup BGP peering with rest of the nodes. (default true)
+      --overlay-type string              Possible values: subnet,full - When set to "subnet", the default, default "--enable-overlay=true" behavior is used. When set to "full", it changes "--enable-overlay=true" default behavior so that IP-in-IP tunneling is used for pod-to-pod networking across nodes regardless of the subnet the nodes are in. (default "subnet")
       --override-nexthop                 Override the next-hop in bgp routes sent to peers with the local ip.
       --peer-router-asns uints           ASN numbers of the BGP peer to which cluster nodes will advertise cluster ip and node's pod cidr. (default [])
       --peer-router-ips ipSlice          The ip address of the external router to which all nodes will peer and advertise the cluster ip and pod cidr's. (default [])
@@ -134,6 +137,39 @@ and if you want to move back to kube-proxy then clean up config done by kube-rou
 ```
 and run kube-proxy with the configuration you have.
 - [General Setup](/README.md#getting-started)
+
+
+## Advertising IPs
+
+kube-router can advertise Cluster, External and LoadBalancer IPs to BGP peers.
+It does this by:
+* locally adding the advertised IPs to the nodes' `kube-dummy-if` network interface
+* advertising the IPs to its BGP peers
+
+To set the default for all services use the `--advertise-cluster-ip`,
+`--advertise-external-ip` and `--advertise-loadbalancer-ip` flags.
+
+To selectively enable or disable this feature per-service use the
+`kube-router.io/service.advertise.clusterip`, `kube-router.io/service.advertise.externalip`
+and `kube-router.io/service.advertise.loadbalancerip` annotations.
+
+e.g.:
+`$ kubectl annotate service my-advertised-service "kube-router.io/service.advertise.clusterip=true"`
+`$ kubectl annotate service my-advertised-service "kube-router.io/service.advertise.externalip=true"`
+`$ kubectl annotate service my-advertised-service "kube-router.io/service.advertise.loadbalancerip=true"`
+
+`$ kubectl annotate service my-non-advertised-service "kube-router.io/service.advertise.clusterip=false"`
+`$ kubectl annotate service my-non-advertised-service "kube-router.io/service.advertise.externalip=false"`
+`$ kubectl annotate service my-non-advertised-service "kube-router.io/service.advertise.loadbalancerip=false"`
+
+By combining the flags with the per-service annotations you can choose either
+a opt-in or opt-out strategy for advertising IPs.
+
+Advertising LoadBalancer IPs works by inspecting the services
+`status.loadBalancer.ingress` IPs that are set by external LoadBalancers like
+for example MetalLb. This has been successfully tested together with
+[MetalLB](https://github.com/google/metallb) in ARP mode.
+
 
 ## Hairpin Mode
 
@@ -217,25 +253,6 @@ For destination hashing scheduling use:
 kubectl annotate service my-service "kube-router.io/service.scheduler=dh"
 ```
 
-## LoadBalancer IPs
-
-If you want to also advertise loadbalancer set IPs
-(`status.loadBalancer.ingress` IPs), e.g. when using it with MetalLb,
-add the `--advertise-loadbalancer-ip` flag (`false` by default).
-
-To selectively disable this behaviour per-service, you can use
-the `kube-router.io/service.skiplbips` annotation as e.g.:
-`$ kubectl annotate service my-external-service "kube-router.io/service.skiplbips=true"`
-
-In concrete, unless the Service is annotated as per above, the
-`--advertise-loadbalancer-ip` flag will make Service's Ingress IP(s)
-set by the LoadBalancer to:
-* be locally added to nodes' `kube-dummy-if` network interface
-* be advertised to BGP peers
-
-FYI Above has been successfully tested together with
-[MetalLB](https://github.com/google/metallb) in ARP mode.
-
 ## HostPort support
 
 If you would like to use `HostPort` functionality below changes are required in the manifest.
@@ -270,6 +287,13 @@ If you would like to use `HostPort` functionality below changes are required in 
 - Restart the container runtime
 
 For an e.g manifest please look at [manifest](../daemonset/kubeadm-kuberouter-all-features-hostport.yaml) with necessary changes required for `HostPort` functionality.
+
+## IPVS Graceful termination support
+
+As of 0.2.6 we support experimental graceful termination of IPVS destinations. When possible the pods's TerminationGracePeriodSeconds is used, if it cannot be retrived for some reason
+the fallback period is 30 seconds and can be adjusted with `--ipvs-graceful-period` cli-opt
+
+graceful termination works in such a way that when kube-router receives a delete endpoint notification for a service it's weight is adjusted to 0 before getting deleted after he termination grace period has passed or the Active & Inactive connections goes down to 0.
 
 ## BGP configuration
 
